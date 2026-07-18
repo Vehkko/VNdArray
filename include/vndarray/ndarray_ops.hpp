@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <type_traits>
 
 #ifndef VEHKKO_NDARRAY_RESTRICT
@@ -719,6 +720,24 @@ namespace vehkko::ndarray {
 
     template <typename T, index_t Rank> inline void zero_inplace(View<T, Rank> dst) noexcept {
         fill_inplace(dst, T{});
+    }
+
+    template <typename T, typename U, index_t Rank>
+    inline void set_inplace(View<T, Rank> dst, std::initializer_list<U> values) noexcept {
+        static_assert(!std::is_const_v<T>, "set_inplace: dst must be writable");
+
+        static_assert(std::is_assignable_v<T&, const U&>,
+                      "set_inplace: values must be assignable to dst elements");
+
+        if constexpr (runtime_shape_check) {
+            require_contract(dst.size() == values.size());
+        }
+
+        T*       data = dst.data();
+        const U* src  = values.begin();
+        index_t  i    = 0;
+
+        detail::for_each_offset(dst, [&](index_t offset) noexcept { data[offset] = src[i++]; });
     }
 
     template <typename T, index_t Rank>
