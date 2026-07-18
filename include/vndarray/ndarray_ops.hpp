@@ -42,7 +42,21 @@ namespace vehkko::ndarray {
         template <typename T, typename U, index_t Rank>
         inline void require_same_extents(View<T, Rank> a, View<U, Rank> b) noexcept {
             if constexpr (runtime_shape_check) {
-                require_contract(same_extents(a, b));
+                if (!same_extents(a, b)) {
+                    for (index_t d = 0; d < Rank; ++d) {
+                        if (a.extent(d) != b.extent(d)) {
+                            std::fprintf(stderr,
+                                         "[vehkko::ndarray][shape] require_same_extents: rank=%zu, "
+                                         "dimension=%zu, first_extent=%zu, second_extent=%zu, "
+                                         "first_data=%p, second_data=%p; %s:%d\n",
+                                         Rank, d, a.extent(d), b.extent(d),
+                                         const_cast<void*>(static_cast<const void*>(a.data())),
+                                         const_cast<void*>(static_cast<const void*>(b.data())),
+                                         __FILE__, __LINE__);
+                            contract_violation();
+                        }
+                    }
+                }
             }
         }
 
@@ -50,8 +64,36 @@ namespace vehkko::ndarray {
         inline void require_same_extents(View<T, Rank> a, View<U, Rank> b,
                                          View<V, Rank> c) noexcept {
             if constexpr (runtime_shape_check) {
-                require_contract(same_extents(a, b));
-                require_contract(same_extents(a, c));
+                if (!same_extents(a, b)) {
+                    for (index_t d = 0; d < Rank; ++d) {
+                        if (a.extent(d) != b.extent(d)) {
+                            std::fprintf(stderr,
+                                         "[vehkko::ndarray][shape] require_same_extents: rank=%zu, "
+                                         "dimension=%zu, first_extent=%zu, second_extent=%zu, "
+                                         "first_data=%p, second_data=%p; %s:%d\n",
+                                         Rank, d, a.extent(d), b.extent(d),
+                                         const_cast<void*>(static_cast<const void*>(a.data())),
+                                         const_cast<void*>(static_cast<const void*>(b.data())),
+                                         __FILE__, __LINE__);
+                            contract_violation();
+                        }
+                    }
+                }
+                if (!same_extents(a, c)) {
+                    for (index_t d = 0; d < Rank; ++d) {
+                        if (a.extent(d) != c.extent(d)) {
+                            std::fprintf(stderr,
+                                         "[vehkko::ndarray][shape] require_same_extents: rank=%zu, "
+                                         "dimension=%zu, first_extent=%zu, third_extent=%zu, "
+                                         "first_data=%p, third_data=%p; %s:%d\n",
+                                         Rank, d, a.extent(d), c.extent(d),
+                                         const_cast<void*>(static_cast<const void*>(a.data())),
+                                         const_cast<void*>(static_cast<const void*>(c.data())),
+                                         __FILE__, __LINE__);
+                            contract_violation();
+                        }
+                    }
+                }
             }
         }
 
@@ -61,7 +103,11 @@ namespace vehkko::ndarray {
         // element. It may conservatively return may_overlap for complex layouts that
         // are actually disjoint.
 
-        enum class AliasRelation : unsigned char { disjoint, same_mapping, may_overlap };
+        enum class AliasRelation : unsigned char {
+            disjoint,
+            same_mapping,
+            may_overlap
+        };
 
         struct ByteEnvelope {
             std::uintptr_t begin = 0;
@@ -77,7 +123,8 @@ namespace vehkko::ndarray {
             return a;
         }
 
-        template <typename T, index_t Rank> inline bool has_zero_extent(View<T, Rank> v) noexcept {
+        template <typename T, index_t Rank>
+        inline bool has_zero_extent(View<T, Rank> v) noexcept {
             for (index_t d = 0; d < Rank; ++d) {
                 if (v.extent(d) == 0) {
                     return true;
@@ -214,7 +261,17 @@ namespace vehkko::ndarray {
         template <typename T, typename U, index_t Rank>
         inline void check_noalias_contract(View<T, Rank> dst, View<U, Rank> src) noexcept {
             if constexpr (runtime_noalias_contract_check) {
-                require_contract(!definitely_overlap_simple(dst, src));
+                if (definitely_overlap_simple(dst, src)) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][noalias] check_noalias_contract: output overlaps "
+                                 "input, rank=%zu, dst_data=%p, src_data=%p, dst_size=%zu, "
+                                 "src_size=%zu; %s:%d\n",
+                                 Rank,
+                                 const_cast<void*>(static_cast<const void*>(dst.data())),
+                                 const_cast<void*>(static_cast<const void*>(src.data())), dst.size(),
+                                 src.size(), __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
         }
 
@@ -660,14 +717,16 @@ namespace vehkko::ndarray {
             using type = T;
         };
 
-        template <typename T> struct abs_result<T, true> {
+        template <typename T>
+        struct abs_result<T, true> {
             using type = std::make_unsigned_t<T>;
         };
 
         template <typename T>
         using abs_result_t = typename abs_result<std::remove_const_t<T>>::type;
 
-        template <typename T> inline abs_result_t<T> abs_value(T x) noexcept {
+        template <typename T>
+        inline abs_result_t<T> abs_value(T x) noexcept {
             using E = std::remove_const_t<T>;
             static_assert(std::is_arithmetic_v<E>, "abs_value requires an arithmetic type");
 
@@ -682,7 +741,8 @@ namespace vehkko::ndarray {
             }
         }
 
-        template <typename T> inline abs_result_t<T> abs_diff_value(T a, T b) noexcept {
+        template <typename T>
+        inline abs_result_t<T> abs_diff_value(T a, T b) noexcept {
             using E = std::remove_const_t<T>;
             static_assert(std::is_arithmetic_v<E>, "abs_diff_value requires an arithmetic type");
 
@@ -718,7 +778,8 @@ namespace vehkko::ndarray {
         detail::for_each_offset(dst, [&](index_t o) noexcept { p[o] = value; });
     }
 
-    template <typename T, index_t Rank> inline void zero_inplace(View<T, Rank> dst) noexcept {
+    template <typename T, index_t Rank>
+    inline void zero_inplace(View<T, Rank> dst) noexcept {
         fill_inplace(dst, T{});
     }
 
@@ -730,7 +791,15 @@ namespace vehkko::ndarray {
                       "set_inplace: values must be assignable to dst elements");
 
         if constexpr (runtime_shape_check) {
-            require_contract(dst.size() == values.size());
+            if (dst.size() != values.size()) {
+                std::fprintf(stderr,
+                             "[vehkko::ndarray][shape] set_inplace: rank=%zu, dst_size=%zu, "
+                             "values_size=%zu, dst_data=%p; %s:%d\n",
+                             Rank, dst.size(), values.size(),
+                             const_cast<void*>(static_cast<const void*>(dst.data())), __FILE__,
+                             __LINE__);
+                contract_violation();
+            }
         }
 
         T*       data = dst.data();
@@ -774,7 +843,8 @@ namespace vehkko::ndarray {
         detail::for_each_offset(dst, [&](index_t o) noexcept { p[o] += beta; });
     }
 
-    template <typename T, index_t Rank> inline void negate_inplace(View<T, Rank> dst) noexcept {
+    template <typename T, index_t Rank>
+    inline void negate_inplace(View<T, Rank> dst) noexcept {
         static_assert(!std::is_const_v<T>, "negate_inplace: dst must be writable");
 
         if (is_row_major_contiguous(dst)) {
@@ -790,7 +860,8 @@ namespace vehkko::ndarray {
         detail::for_each_offset(dst, [&](index_t o) noexcept { p[o] = -p[o]; });
     }
 
-    template <typename T, index_t Rank> inline void square_inplace(View<T, Rank> dst) noexcept {
+    template <typename T, index_t Rank>
+    inline void square_inplace(View<T, Rank> dst) noexcept {
         static_assert(!std::is_const_v<T>, "square_inplace: dst must be writable");
 
         if (is_row_major_contiguous(dst)) {
@@ -829,8 +900,7 @@ namespace vehkko::ndarray {
 
         T*       d = dst.data();
         const T* s = src.data();
-        detail::for_each_offset2(dst, src,
-                                 [&](index_t doff, index_t soff) noexcept { d[doff] = s[soff]; });
+        detail::for_each_offset2(dst, src, [&](index_t doff, index_t soff) noexcept { d[doff] = s[soff]; });
     }
 
     template <typename T, typename S, index_t Rank>
@@ -845,8 +915,7 @@ namespace vehkko::ndarray {
 
         if constexpr (!runtime_alias_dispatch) {
             if (is_row_major_contiguous(dst) && is_row_major_contiguous(src)) {
-                std::memmove(static_cast<void*>(dst.data()), static_cast<const void*>(src.data()),
-                             dst.size() * sizeof(T));
+                std::memmove(static_cast<void*>(dst.data()), static_cast<const void*>(src.data()), dst.size() * sizeof(T));
                 return;
             }
 
@@ -867,8 +936,7 @@ namespace vehkko::ndarray {
         }
 
         if (is_row_major_contiguous(dst) && is_row_major_contiguous(src)) {
-            std::memmove(static_cast<void*>(dst.data()), static_cast<const void*>(src.data()),
-                         dst.size() * sizeof(T));
+            std::memmove(static_cast<void*>(dst.data()), static_cast<const void*>(src.data()), dst.size() * sizeof(T));
             return;
         }
 
@@ -1190,8 +1258,7 @@ namespace vehkko::ndarray {
 
         if (is_row_major_contiguous(dst) && is_row_major_contiguous(x) &&
             is_row_major_contiguous(y)) {
-            detail::axpby_contiguous_noalias(dst.size(), dst.data(), alpha, x.data(), beta,
-                                             y.data());
+            detail::axpby_contiguous_noalias(dst.size(), dst.data(), alpha, x.data(), beta, y.data());
             return;
         }
 
@@ -1265,8 +1332,7 @@ namespace vehkko::ndarray {
 
         T*       d  = dst.data();
         const T* xp = x.data();
-        detail::for_each_offset2(dst, x,
-                                 [&](index_t doff, index_t xoff) noexcept { d[doff] += xp[xoff]; });
+        detail::for_each_offset2(dst, x, [&](index_t doff, index_t xoff) noexcept { d[doff] += xp[xoff]; });
     }
 
     template <typename T, typename X, index_t Rank>
@@ -1301,8 +1367,7 @@ namespace vehkko::ndarray {
             return;
         }
 
-        detail::for_each_offset2(dst, x,
-                                 [&](index_t doff, index_t xoff) noexcept { d[doff] += xp[xoff]; });
+        detail::for_each_offset2(dst, x, [&](index_t doff, index_t xoff) noexcept { d[doff] += xp[xoff]; });
     }
 
     template <typename T, typename X, index_t Rank>
@@ -1321,8 +1386,7 @@ namespace vehkko::ndarray {
 
         T*       d  = dst.data();
         const T* xp = x.data();
-        detail::for_each_offset2(dst, x,
-                                 [&](index_t doff, index_t xoff) noexcept { d[doff] -= xp[xoff]; });
+        detail::for_each_offset2(dst, x, [&](index_t doff, index_t xoff) noexcept { d[doff] -= xp[xoff]; });
     }
 
     template <typename T, typename X, index_t Rank>
@@ -1357,8 +1421,7 @@ namespace vehkko::ndarray {
             return;
         }
 
-        detail::for_each_offset2(dst, x,
-                                 [&](index_t doff, index_t xoff) noexcept { d[doff] -= xp[xoff]; });
+        detail::for_each_offset2(dst, x, [&](index_t doff, index_t xoff) noexcept { d[doff] -= xp[xoff]; });
     }
 
     template <typename T, typename X, index_t Rank>
@@ -1377,8 +1440,7 @@ namespace vehkko::ndarray {
 
         T*       d  = dst.data();
         const T* xp = x.data();
-        detail::for_each_offset2(dst, x,
-                                 [&](index_t doff, index_t xoff) noexcept { d[doff] *= xp[xoff]; });
+        detail::for_each_offset2(dst, x, [&](index_t doff, index_t xoff) noexcept { d[doff] *= xp[xoff]; });
     }
 
     template <typename T, typename X, index_t Rank>
@@ -1413,8 +1475,7 @@ namespace vehkko::ndarray {
             return;
         }
 
-        detail::for_each_offset2(dst, x,
-                                 [&](index_t doff, index_t xoff) noexcept { d[doff] *= xp[xoff]; });
+        detail::for_each_offset2(dst, x, [&](index_t doff, index_t xoff) noexcept { d[doff] *= xp[xoff]; });
     }
 
     template <typename T, typename X, index_t Rank>
@@ -1567,7 +1628,14 @@ namespace vehkko::ndarray {
     inline std::remove_const_t<T> min_value(View<T, Rank> x) noexcept {
         using R = std::remove_const_t<T>;
         if constexpr (runtime_shape_check) {
-            require_contract(!x.empty());
+            if (x.empty()) {
+                std::fprintf(stderr,
+                             "[vehkko::ndarray][shape] min_value: input view is empty, rank=%zu, "
+                             "data=%p; %s:%d\n",
+                             Rank, const_cast<void*>(static_cast<const void*>(x.data())), __FILE__,
+                             __LINE__);
+                contract_violation();
+            }
         }
 
         const T* p      = x.data();
@@ -1581,7 +1649,14 @@ namespace vehkko::ndarray {
     inline std::remove_const_t<T> max_value(View<T, Rank> x) noexcept {
         using R = std::remove_const_t<T>;
         if constexpr (runtime_shape_check) {
-            require_contract(!x.empty());
+            if (x.empty()) {
+                std::fprintf(stderr,
+                             "[vehkko::ndarray][shape] max_value: input view is empty, rank=%zu, "
+                             "data=%p; %s:%d\n",
+                             Rank, const_cast<void*>(static_cast<const void*>(x.data())), __FILE__,
+                             __LINE__);
+                contract_violation();
+            }
         }
 
         const T* p      = x.data();

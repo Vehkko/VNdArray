@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <limits>
@@ -86,7 +87,10 @@ namespace vehkko::ndarray {
 
     // Contract failures do not create or propagate library-defined exceptions.
     // Allocation and element-construction failures may still propagate.
-    [[noreturn]] inline void contract_violation() noexcept { std::terminate(); }
+    [[noreturn]] inline void contract_violation() noexcept {
+        std::fflush(stderr);
+        std::terminate();
+    }
 
     inline void require_contract(bool condition) noexcept {
         if (!condition) {
@@ -123,11 +127,17 @@ namespace vehkko::ndarray {
         return n > 0 && (n & (n - 1)) == 0;
     }
 
-    constexpr inline index_t max_index(index_t a, index_t b) noexcept { return a > b ? a : b; }
+    constexpr inline index_t max_index(index_t a, index_t b) noexcept {
+        return a > b ? a : b;
+    }
 
     inline index_t checked_add(index_t a, index_t b) noexcept {
         if constexpr (runtime_overflow_check) {
             if (b > std::numeric_limits<index_t>::max() - a) {
+                std::fprintf(stderr,
+                             "[vehkko::ndarray][overflow] checked_add: a=%zu, b=%zu, "
+                             "max=%zu; %s:%d\n",
+                             a, b, std::numeric_limits<index_t>::max(), __FILE__, __LINE__);
                 contract_violation();
             }
         }
@@ -137,13 +147,18 @@ namespace vehkko::ndarray {
     inline index_t checked_mul(index_t a, index_t b) noexcept {
         if constexpr (runtime_overflow_check) {
             if (a != 0 && b > std::numeric_limits<index_t>::max() / a) {
+                std::fprintf(stderr,
+                             "[vehkko::ndarray][overflow] checked_mul: a=%zu, b=%zu, "
+                             "max=%zu; %s:%d\n",
+                             a, b, std::numeric_limits<index_t>::max(), __FILE__, __LINE__);
                 contract_violation();
             }
         }
         return a * b;
     }
 
-    template <index_t Rank> inline bool has_zero_extent(const index_t (&extent)[Rank]) noexcept {
+    template <index_t Rank>
+    inline bool has_zero_extent(const index_t (&extent)[Rank]) noexcept {
         for (index_t d = 0; d < Rank; ++d) {
             if (extent[d] == 0) {
                 return true;
@@ -152,7 +167,8 @@ namespace vehkko::ndarray {
         return false;
     }
 
-    template <index_t Rank> inline index_t product(const index_t (&extent)[Rank]) noexcept {
+    template <index_t Rank>
+    inline index_t product(const index_t (&extent)[Rank]) noexcept {
         if (has_zero_extent(extent)) {
             return 0;
         }
@@ -209,7 +225,8 @@ namespace vehkko::ndarray {
     // Buffer: owning aligned dynamic memory
     // -----------------------------------------------------------------------------
 
-    template <typename T> class Buffer {
+    template <typename T>
+    class Buffer {
         static_assert(
             is_valid_storage_element_v<T>,
             "vehkko::ndarray::Buffer<T>: T must be non-cv, non-reference, trivially copyable, "
@@ -225,12 +242,37 @@ namespace vehkko::ndarray {
                         Allocator allocator = default_allocator())
             : size_(size), alignment_(max_index(alignment, alignof(T))), allocator_(allocator) {
             if constexpr (runtime_alignment_check) {
-                require_contract(is_valid_alignment(alignment));
-                require_contract(is_valid_alignment(alignment_));
+                if (!is_valid_alignment(alignment)) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][alignment] Buffer::Buffer: requested_alignment=%zu "
+                                 "is not a positive power of two; %s:%d\n",
+                                 alignment, __FILE__, __LINE__);
+                    contract_violation();
+                }
+                if (!is_valid_alignment(alignment_)) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][alignment] Buffer::Buffer: effective_alignment=%zu "
+                                 "is not a positive power of two, requested_alignment=%zu, "
+                                 "alignof(T)=%zu; %s:%d\n",
+                                 alignment_, alignment, alignof(T), __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             if constexpr (runtime_allocator_check) {
-                require_contract(allocator_.allocate != nullptr);
-                require_contract(allocator_.deallocate != nullptr);
+                if (allocator_.allocate == nullptr) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][allocator] Buffer::Buffer: allocate callback is null, "
+                                 "size=%zu, alignment=%zu; %s:%d\n",
+                                 size_, alignment_, __FILE__, __LINE__);
+                    contract_violation();
+                }
+                if (allocator_.deallocate == nullptr) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][allocator] Buffer::Buffer: deallocate callback is null, "
+                                 "size=%zu, alignment=%zu; %s:%d\n",
+                                 size_, alignment_, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             allocate_();
         }
@@ -254,8 +296,7 @@ namespace vehkko::ndarray {
         }
 
         Buffer(Buffer&& other) noexcept
-            : size_(other.size_), alignment_(other.alignment_), data_(other.data_),
-              allocator_(other.allocator_) {
+            : size_(other.size_), alignment_(other.alignment_), data_(other.data_), allocator_(other.allocator_) {
             other.clear_state_();
         }
 
@@ -293,28 +334,48 @@ namespace vehkko::ndarray {
 
         T& front() noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(size_ != 0);
+                if (size_ == 0) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] Buffer::front: buffer is empty; %s:%d\n",
+                                 __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return data_[0];
         }
 
         const T& front() const noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(size_ != 0);
+                if (size_ == 0) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] Buffer::front const: buffer is empty; %s:%d\n",
+                                 __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return data_[0];
         }
 
         T& back() noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(size_ != 0);
+                if (size_ == 0) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] Buffer::back: buffer is empty; %s:%d\n",
+                                 __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return data_[size_ - 1];
         }
 
         const T& back() const noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(size_ != 0);
+                if (size_ == 0) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] Buffer::back const: buffer is empty; %s:%d\n",
+                                 __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return data_[size_ - 1];
         }
@@ -327,14 +388,26 @@ namespace vehkko::ndarray {
 
         T& operator[](index_t i) noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(i < size_);
+                if (i >= size_) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] Buffer::operator[]: index=%zu, size=%zu; "
+                                 "%s:%d\n",
+                                 i, size_, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return data_[i];
         }
 
         const T& operator[](index_t i) const noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(i < size_);
+                if (i >= size_) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] Buffer::operator[] const: index=%zu, size=%zu; "
+                                 "%s:%d\n",
+                                 i, size_, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return data_[i];
         }
@@ -348,8 +421,21 @@ namespace vehkko::ndarray {
             const index_t byte_count = checked_mul(size_, sizeof(T));
             void*         raw        = allocator_.allocate(allocator_.ctx, byte_count, alignment_);
             if constexpr (runtime_allocator_check) {
-                require_contract(raw != nullptr);
-                require_contract(reinterpret_cast<std::uintptr_t>(raw) % alignment_ == 0);
+                if (raw == nullptr) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][allocator] Buffer::allocate_: allocator returned null, "
+                                 "size=%zu, bytes=%zu, alignment=%zu; %s:%d\n",
+                                 size_, byte_count, alignment_, __FILE__, __LINE__);
+                    contract_violation();
+                }
+                if (reinterpret_cast<std::uintptr_t>(raw) % alignment_ != 0) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][allocator] Buffer::allocate_: allocator returned "
+                                 "misaligned pointer=%p, requested_alignment=%zu, size=%zu, bytes=%zu; "
+                                 "%s:%d\n",
+                                 raw, alignment_, size_, byte_count, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
 
             T* data = static_cast<T*>(raw);
@@ -444,14 +530,26 @@ namespace vehkko::ndarray {
 
         T& operator[](index_t i) noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(i < Capacity);
+                if (i >= Capacity) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] StaticBuffer::operator[]: index=%zu, "
+                                 "capacity=%zu; %s:%d\n",
+                                 i, Capacity, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return data_[i];
         }
 
         const T& operator[](index_t i) const noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(i < Capacity);
+                if (i >= Capacity) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] StaticBuffer::operator[] const: index=%zu, "
+                                 "capacity=%zu; %s:%d\n",
+                                 i, Capacity, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return data_[i];
         }
@@ -465,7 +563,8 @@ namespace vehkko::ndarray {
     // View constness follows span semantics. A const View<T, Rank> still refers to
     // mutable T. Use View<const T, Rank> for read-only elements.
 
-    template <typename T, index_t Rank> class View {
+    template <typename T, index_t Rank>
+    class View {
         static_assert(is_valid_view_element_v<T>,
                       "vehkko::ndarray::View<T, Rank>: T must be non-reference, "
                       "non-volatile, trivially copyable, trivially destructible, "
@@ -497,7 +596,8 @@ namespace vehkko::ndarray {
         template <typename U,
                   std::enable_if_t<std::is_const_v<T> && std::is_same_v<std::remove_const_t<T>, U>,
                                    int> = 0>
-        View(const View<U, Rank>& other) noexcept : data_(other.data()) {
+        View(const View<U, Rank>& other) noexcept
+            : data_(other.data()) {
             for (index_t d = 0; d < Rank; ++d) {
                 extent_[d] = other.extent(d);
                 stride_[d] = other.stride(d);
@@ -509,14 +609,26 @@ namespace vehkko::ndarray {
 
         index_t extent(index_t d) const noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(d < Rank);
+                if (d >= Rank) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] View::extent: dimension=%zu, rank=%zu; "
+                                 "%s:%d\n",
+                                 d, Rank, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return extent_[d];
         }
 
         index_t stride(index_t d) const noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(d < Rank);
+                if (d >= Rank) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] View::stride: dimension=%zu, rank=%zu; "
+                                 "%s:%d\n",
+                                 d, Rank, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return stride_[d];
         }
@@ -543,16 +655,19 @@ namespace vehkko::ndarray {
 
         explicit operator bool() const noexcept { return data_ != nullptr; }
 
-        template <typename... I> T& operator()(I... indices) noexcept {
+        template <typename... I>
+        T& operator()(I... indices) noexcept {
             return access_(indices...);
         }
 
-        template <typename... I> T& operator()(I... indices) const noexcept {
+        template <typename... I>
+        T& operator()(I... indices) const noexcept {
             return access_(indices...);
         }
 
       private:
-        template <typename... I> T& access_(I... indices) const noexcept {
+        template <typename... I>
+        T& access_(I... indices) const noexcept {
             static_assert(sizeof...(I) == Rank,
                           "vehkko::ndarray::View::operator(): wrong number of "
                           "indices");
@@ -561,7 +676,13 @@ namespace vehkko::ndarray {
 
             if constexpr (runtime_bounds_check) {
                 for (index_t d = 0; d < Rank; ++d) {
-                    require_contract(idx[d] < extent_[d]);
+                    if (idx[d] >= extent_[d]) {
+                        std::fprintf(stderr,
+                                     "[vehkko::ndarray][bounds] View::operator(): rank=%zu, "
+                                     "dimension=%zu, index=%zu, extent=%zu; %s:%d\n",
+                                     Rank, d, idx[d], extent_[d], __FILE__, __LINE__);
+                        contract_violation();
+                    }
                 }
             }
 
@@ -587,10 +708,20 @@ namespace vehkko::ndarray {
                 }
 
                 if constexpr (runtime_layout_check) {
-                    require_contract(data_ != nullptr);
+                    if (data_ == nullptr) {
+                        std::fprintf(stderr,
+                                     "[vehkko::ndarray][layout] View::validate_layout_: non-empty view "
+                                     "has null data, rank=%zu; %s:%d\n",
+                                     Rank, __FILE__, __LINE__);
+                        contract_violation();
+                    }
                     for (index_t d = 0; d < Rank; ++d) {
-                        if (extent_[d] > 1) {
-                            require_contract(stride_[d] != 0);
+                        if (extent_[d] > 1 && stride_[d] == 0) {
+                            std::fprintf(stderr,
+                                         "[vehkko::ndarray][layout] View::validate_layout_: rank=%zu, "
+                                         "dimension=%zu, extent=%zu, stride=0; %s:%d\n",
+                                         Rank, d, extent_[d], __FILE__, __LINE__);
+                            contract_violation();
                         }
                     }
                 }
@@ -609,8 +740,14 @@ namespace vehkko::ndarray {
 
                     if (data_ != nullptr) {
                         const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(data_);
-                        require_contract(span_bytes <=
-                                         std::numeric_limits<std::uintptr_t>::max() - begin);
+                        if (span_bytes > std::numeric_limits<std::uintptr_t>::max() - begin) {
+                            std::fprintf(stderr,
+                                         "[vehkko::ndarray][overflow] View::validate_layout_: address "
+                                         "range overflows, data=%p, rank=%zu, span_bytes=%zu; %s:%d\n",
+                                         const_cast<void*>(static_cast<const void*>(data_)), Rank,
+                                         span_bytes, __FILE__, __LINE__);
+                            contract_violation();
+                        }
                     }
                 }
             }
@@ -625,7 +762,8 @@ namespace vehkko::ndarray {
     // Array: owning row-major dynamic ndarray
     // -----------------------------------------------------------------------------
 
-    template <typename T, index_t Rank> class Array {
+    template <typename T, index_t Rank>
+    class Array {
         static_assert(
             is_valid_storage_element_v<T>,
             "vehkko::ndarray::Array<T, Rank>: T must be non-cv, non-reference, trivially copyable, "
@@ -645,7 +783,10 @@ namespace vehkko::ndarray {
             set_shape_(extent);
         }
 
-        Array(const Array& other) : buffer_(other.buffer_) { copy_shape_from_(other); }
+        Array(const Array& other)
+            : buffer_(other.buffer_) {
+            copy_shape_from_(other);
+        }
 
         Array& operator=(const Array& other) {
             if (this != &other) {
@@ -656,7 +797,8 @@ namespace vehkko::ndarray {
             return *this;
         }
 
-        Array(Array&& other) noexcept : buffer_(std::move(other.buffer_)) {
+        Array(Array&& other) noexcept
+            : buffer_(std::move(other.buffer_)) {
             copy_shape_from_(other);
             other.clear_shape_();
         }
@@ -673,7 +815,13 @@ namespace vehkko::ndarray {
         void reshape(const index_t (&extent)[Rank]) noexcept {
             const index_t new_size = product(extent);
             if constexpr (runtime_shape_check) {
-                require_contract(new_size == size());
+                if (new_size != size()) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][shape] Array::reshape: rank=%zu, current_size=%zu, "
+                                 "requested_size=%zu; %s:%d\n",
+                                 Rank, size(), new_size, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             set_shape_(extent);
         }
@@ -699,14 +847,26 @@ namespace vehkko::ndarray {
 
         index_t extent(index_t d) const noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(d < Rank);
+                if (d >= Rank) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] Array::extent: dimension=%zu, rank=%zu; "
+                                 "%s:%d\n",
+                                 d, Rank, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return extent_[d];
         }
 
         index_t stride(index_t d) const noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(d < Rank);
+                if (d >= Rank) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] Array::stride: dimension=%zu, rank=%zu; "
+                                 "%s:%d\n",
+                                 d, Rank, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return stride_[d];
         }
@@ -724,14 +884,21 @@ namespace vehkko::ndarray {
 
         View<const T, Rank> view() const&& noexcept = delete;
 
-        template <typename... I> T& operator()(I... indices) noexcept {
+        template <typename... I>
+        T& operator()(I... indices) noexcept {
             static_assert(sizeof...(I) == Rank,
                           "vehkko::ndarray::Array::operator(): wrong number of indices");
 
             const index_t idx[Rank] = {static_cast<index_t>(indices)...};
             if constexpr (runtime_bounds_check) {
                 for (index_t d = 0; d < Rank; ++d) {
-                    require_contract(idx[d] < extent_[d]);
+                    if (idx[d] >= extent_[d]) {
+                        std::fprintf(stderr,
+                                     "[vehkko::ndarray][bounds] Array::operator(): rank=%zu, "
+                                     "dimension=%zu, index=%zu, extent=%zu; %s:%d\n",
+                                     Rank, d, idx[d], extent_[d], __FILE__, __LINE__);
+                        contract_violation();
+                    }
                 }
             }
 
@@ -742,14 +909,21 @@ namespace vehkko::ndarray {
             return buffer_.data()[linear];
         }
 
-        template <typename... I> const T& operator()(I... indices) const noexcept {
+        template <typename... I>
+        const T& operator()(I... indices) const noexcept {
             static_assert(sizeof...(I) == Rank,
                           "vehkko::ndarray::Array::operator(): wrong number of indices");
 
             const index_t idx[Rank] = {static_cast<index_t>(indices)...};
             if constexpr (runtime_bounds_check) {
                 for (index_t d = 0; d < Rank; ++d) {
-                    require_contract(idx[d] < extent_[d]);
+                    if (idx[d] >= extent_[d]) {
+                        std::fprintf(stderr,
+                                     "[vehkko::ndarray][bounds] Array::operator() const: rank=%zu, "
+                                     "dimension=%zu, index=%zu, extent=%zu; %s:%d\n",
+                                     Rank, d, idx[d], extent_[d], __FILE__, __LINE__);
+                        contract_violation();
+                    }
                 }
             }
 
@@ -823,7 +997,13 @@ namespace vehkko::ndarray {
         void reshape(const index_t (&extent)[Rank]) noexcept {
             const index_t n = product(extent);
             if constexpr (runtime_shape_check) {
-                require_contract(n <= Capacity);
+                if (n > Capacity) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][capacity] StaticArray::reshape: rank=%zu, "
+                                 "requested_size=%zu, capacity=%zu; %s:%d\n",
+                                 Rank, n, Capacity, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
 
             size_ = n;
@@ -843,28 +1023,52 @@ namespace vehkko::ndarray {
 
         T& front() noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(size_ != 0);
+                if (size_ == 0) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] StaticArray::front: array is empty, "
+                                 "rank=%zu, capacity=%zu; %s:%d\n",
+                                 Rank, Capacity, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return storage_[0];
         }
 
         const T& front() const noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(size_ != 0);
+                if (size_ == 0) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] StaticArray::front const: array is empty, "
+                                 "rank=%zu, capacity=%zu; %s:%d\n",
+                                 Rank, Capacity, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return storage_[0];
         }
 
         T& back() noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(size_ != 0);
+                if (size_ == 0) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] StaticArray::back: array is empty, "
+                                 "rank=%zu, capacity=%zu; %s:%d\n",
+                                 Rank, Capacity, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return storage_[size_ - 1];
         }
 
         const T& back() const noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(size_ != 0);
+                if (size_ == 0) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] StaticArray::back const: array is empty, "
+                                 "rank=%zu, capacity=%zu; %s:%d\n",
+                                 Rank, Capacity, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return storage_[size_ - 1];
         }
@@ -881,14 +1085,26 @@ namespace vehkko::ndarray {
 
         index_t extent(index_t d) const noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(d < Rank);
+                if (d >= Rank) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] StaticArray::extent: dimension=%zu, rank=%zu; "
+                                 "%s:%d\n",
+                                 d, Rank, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return extent_[d];
         }
 
         index_t stride(index_t d) const noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(d < Rank);
+                if (d >= Rank) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] StaticArray::stride: dimension=%zu, rank=%zu; "
+                                 "%s:%d\n",
+                                 d, Rank, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return stride_[d];
         }
@@ -906,14 +1122,21 @@ namespace vehkko::ndarray {
 
         View<const T, Rank> view() const&& noexcept = delete;
 
-        template <typename... I> T& operator()(I... indices) noexcept {
+        template <typename... I>
+        T& operator()(I... indices) noexcept {
             static_assert(sizeof...(I) == Rank,
                           "vehkko::ndarray::StaticArray::operator(): wrong number of indices");
 
             const index_t idx[Rank] = {static_cast<index_t>(indices)...};
             if constexpr (runtime_bounds_check) {
                 for (index_t d = 0; d < Rank; ++d) {
-                    require_contract(idx[d] < extent_[d]);
+                    if (idx[d] >= extent_[d]) {
+                        std::fprintf(stderr,
+                                     "[vehkko::ndarray][bounds] StaticArray::operator(): rank=%zu, "
+                                     "dimension=%zu, index=%zu, extent=%zu; %s:%d\n",
+                                     Rank, d, idx[d], extent_[d], __FILE__, __LINE__);
+                        contract_violation();
+                    }
                 }
             }
 
@@ -924,14 +1147,21 @@ namespace vehkko::ndarray {
             return storage_.data()[linear];
         }
 
-        template <typename... I> const T& operator()(I... indices) const noexcept {
+        template <typename... I>
+        const T& operator()(I... indices) const noexcept {
             static_assert(sizeof...(I) == Rank,
                           "vehkko::ndarray::StaticArray::operator(): wrong number of indices");
 
             const index_t idx[Rank] = {static_cast<index_t>(indices)...};
             if constexpr (runtime_bounds_check) {
                 for (index_t d = 0; d < Rank; ++d) {
-                    require_contract(idx[d] < extent_[d]);
+                    if (idx[d] >= extent_[d]) {
+                        std::fprintf(stderr,
+                                     "[vehkko::ndarray][bounds] StaticArray::operator() const: rank=%zu, "
+                                     "dimension=%zu, index=%zu, extent=%zu; %s:%d\n",
+                                     Rank, d, idx[d], extent_[d], __FILE__, __LINE__);
+                        contract_violation();
+                    }
                 }
             }
 
@@ -944,14 +1174,26 @@ namespace vehkko::ndarray {
 
         T& operator[](index_t i) noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(i < size_);
+                if (i >= size_) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] StaticArray::operator[]: index=%zu, "
+                                 "size=%zu, capacity=%zu; %s:%d\n",
+                                 i, size_, Capacity, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return storage_[i];
         }
 
         const T& operator[](index_t i) const noexcept {
             if constexpr (runtime_bounds_check) {
-                require_contract(i < size_);
+                if (i >= size_) {
+                    std::fprintf(stderr,
+                                 "[vehkko::ndarray][bounds] StaticArray::operator[] const: index=%zu, "
+                                 "size=%zu, capacity=%zu; %s:%d\n",
+                                 i, size_, Capacity, __FILE__, __LINE__);
+                    contract_violation();
+                }
             }
             return storage_[i];
         }
@@ -995,13 +1237,15 @@ namespace vehkko::ndarray {
         return View<T, Rank>(data, extent, stride);
     }
 
-    template <typename T> inline View<T, 1> make_view1d(T* data, index_t n0) noexcept {
+    template <typename T>
+    inline View<T, 1> make_view1d(T* data, index_t n0) noexcept {
         const index_t extent[1] = {n0};
         const index_t stride[1] = {1};
         return View<T, 1>(data, extent, stride);
     }
 
-    template <typename T> inline View<T, 2> make_view2d(T* data, index_t n0, index_t n1) noexcept {
+    template <typename T>
+    inline View<T, 2> make_view2d(T* data, index_t n0, index_t n1) noexcept {
         const index_t extent[2] = {n0, n1};
         const index_t stride[2] = {n1, 1};
         return View<T, 2>(data, extent, stride);
@@ -1052,7 +1296,8 @@ namespace vehkko::ndarray {
     // Layout and shape queries
     // -----------------------------------------------------------------------------
 
-    template <typename T, index_t Rank> inline bool is_inner_contiguous(View<T, Rank> v) noexcept {
+    template <typename T, index_t Rank>
+    inline bool is_inner_contiguous(View<T, Rank> v) noexcept {
         return v.stride(Rank - 1) == 1;
     }
 
@@ -1101,9 +1346,16 @@ namespace vehkko::ndarray {
     // View derivation
     // -----------------------------------------------------------------------------
 
-    template <typename T> inline View<T, 1> row_view(View<T, 2> v, index_t i) noexcept {
+    template <typename T>
+    inline View<T, 1> row_view(View<T, 2> v, index_t i) noexcept {
         if constexpr (runtime_bounds_check) {
-            require_contract(i < v.extent(0));
+            if (i >= v.extent(0)) {
+                std::fprintf(stderr,
+                             "[vehkko::ndarray][bounds] row_view: row=%zu, rows=%zu, columns=%zu; "
+                             "%s:%d\n",
+                             i, v.extent(0), v.extent(1), __FILE__, __LINE__);
+                contract_violation();
+            }
         }
 
         const index_t extent[1] = {v.extent(1)};
@@ -1116,9 +1368,16 @@ namespace vehkko::ndarray {
         return View<T, 1>(data, extent, stride);
     }
 
-    template <typename T> inline View<T, 1> col_view(View<T, 2> v, index_t j) noexcept {
+    template <typename T>
+    inline View<T, 1> col_view(View<T, 2> v, index_t j) noexcept {
         if constexpr (runtime_bounds_check) {
-            require_contract(j < v.extent(1));
+            if (j >= v.extent(1)) {
+                std::fprintf(stderr,
+                             "[vehkko::ndarray][bounds] col_view: column=%zu, rows=%zu, columns=%zu; "
+                             "%s:%d\n",
+                             j, v.extent(0), v.extent(1), __FILE__, __LINE__);
+                contract_violation();
+            }
         }
 
         const index_t extent[1] = {v.extent(0)};
@@ -1135,10 +1394,33 @@ namespace vehkko::ndarray {
     inline View<T, 2> block_view(View<T, 2> v, index_t i0, index_t j0, index_t n0,
                                  index_t n1) noexcept {
         if constexpr (runtime_bounds_check) {
-            require_contract(i0 <= v.extent(0));
-            require_contract(j0 <= v.extent(1));
-            require_contract(n0 <= v.extent(0) - i0);
-            require_contract(n1 <= v.extent(1) - j0);
+            if (i0 > v.extent(0)) {
+                std::fprintf(stderr,
+                             "[vehkko::ndarray][bounds] block_view: start_row=%zu, rows=%zu; %s:%d\n",
+                             i0, v.extent(0), __FILE__, __LINE__);
+                contract_violation();
+            }
+            if (j0 > v.extent(1)) {
+                std::fprintf(stderr,
+                             "[vehkko::ndarray][bounds] block_view: start_column=%zu, columns=%zu; "
+                             "%s:%d\n",
+                             j0, v.extent(1), __FILE__, __LINE__);
+                contract_violation();
+            }
+            if (n0 > v.extent(0) - i0) {
+                std::fprintf(stderr,
+                             "[vehkko::ndarray][bounds] block_view: start_row=%zu, block_rows=%zu, "
+                             "rows=%zu; %s:%d\n",
+                             i0, n0, v.extent(0), __FILE__, __LINE__);
+                contract_violation();
+            }
+            if (n1 > v.extent(1) - j0) {
+                std::fprintf(stderr,
+                             "[vehkko::ndarray][bounds] block_view: start_column=%zu, "
+                             "block_columns=%zu, columns=%zu; %s:%d\n",
+                             j0, n1, v.extent(1), __FILE__, __LINE__);
+                contract_violation();
+            }
         }
 
         const index_t extent[2] = {n0, n1};
@@ -1151,9 +1433,18 @@ namespace vehkko::ndarray {
         return View<T, 2>(data, extent, stride);
     }
 
-    template <typename T, index_t Rank> inline View<T, 1> flatten_view(View<T, Rank> v) noexcept {
+    template <typename T, index_t Rank>
+    inline View<T, 1> flatten_view(View<T, Rank> v) noexcept {
         if constexpr (runtime_layout_check) {
-            require_contract(is_row_major_contiguous(v));
+            if (!is_row_major_contiguous(v)) {
+                std::fprintf(stderr,
+                             "[vehkko::ndarray][layout] flatten_view: view is not row-major "
+                             "contiguous, rank=%zu, size=%zu, data=%p; %s:%d\n",
+                             Rank, v.size(),
+                             const_cast<void*>(static_cast<const void*>(v.data())), __FILE__,
+                             __LINE__);
+                contract_violation();
+            }
         }
 
         const index_t extent[1] = {v.size()};
