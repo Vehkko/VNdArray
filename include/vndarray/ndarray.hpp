@@ -1,0 +1,1195 @@
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
+#include <exception>
+#include <limits>
+#include <memory>
+#include <new>
+#include <type_traits>
+#include <utility>
+
+// Configuration
+// -----------------------------------------------------------------------------
+// Every switch is an integer macro and may be defined to 0 or 1 before this
+// header is included. Checks guarded by these constants are removed completely
+// when disabled.
+
+#ifndef VEHKKO_NDARRAY_BOUNDS_CHECK
+#    ifdef NDEBUG
+#        define VEHKKO_NDARRAY_BOUNDS_CHECK 0
+#    else
+#        define VEHKKO_NDARRAY_BOUNDS_CHECK 1
+#    endif
+#endif
+
+#ifndef VEHKKO_NDARRAY_SHAPE_CHECK
+#    define VEHKKO_NDARRAY_SHAPE_CHECK 1
+#endif
+
+#ifndef VEHKKO_NDARRAY_OVERFLOW_CHECK
+#    define VEHKKO_NDARRAY_OVERFLOW_CHECK 1
+#endif
+
+#ifndef VEHKKO_NDARRAY_ALIGNMENT_CHECK
+#    ifdef NDEBUG
+#        define VEHKKO_NDARRAY_ALIGNMENT_CHECK 0
+#    else
+#        define VEHKKO_NDARRAY_ALIGNMENT_CHECK 1
+#    endif
+#endif
+
+#ifndef VEHKKO_NDARRAY_ALLOCATOR_CHECK
+#    ifdef NDEBUG
+#        define VEHKKO_NDARRAY_ALLOCATOR_CHECK 0
+#    else
+#        define VEHKKO_NDARRAY_ALLOCATOR_CHECK 1
+#    endif
+#endif
+
+#ifndef VEHKKO_NDARRAY_ALIAS_DISPATCH
+#    define VEHKKO_NDARRAY_ALIAS_DISPATCH 1
+#endif
+
+#ifndef VEHKKO_NDARRAY_NOALIAS_CONTRACT_CHECK
+#    ifdef NDEBUG
+#        define VEHKKO_NDARRAY_NOALIAS_CONTRACT_CHECK 0
+#    else
+#        define VEHKKO_NDARRAY_NOALIAS_CONTRACT_CHECK 1
+#    endif
+#endif
+
+#ifndef VEHKKO_NDARRAY_LAYOUT_CHECK
+#    ifdef NDEBUG
+#        define VEHKKO_NDARRAY_LAYOUT_CHECK 0
+#    else
+#        define VEHKKO_NDARRAY_LAYOUT_CHECK 1
+#    endif
+#endif
+
+namespace vehkko::ndarray {
+
+using index_t                              = std::size_t;
+inline constexpr index_t default_alignment = 64;
+
+inline constexpr bool runtime_bounds_check           = VEHKKO_NDARRAY_BOUNDS_CHECK != 0;
+inline constexpr bool runtime_shape_check            = VEHKKO_NDARRAY_SHAPE_CHECK != 0;
+inline constexpr bool runtime_overflow_check         = VEHKKO_NDARRAY_OVERFLOW_CHECK != 0;
+inline constexpr bool runtime_alignment_check        = VEHKKO_NDARRAY_ALIGNMENT_CHECK != 0;
+inline constexpr bool runtime_allocator_check        = VEHKKO_NDARRAY_ALLOCATOR_CHECK != 0;
+inline constexpr bool runtime_alias_dispatch         = VEHKKO_NDARRAY_ALIAS_DISPATCH != 0;
+inline constexpr bool runtime_noalias_contract_check = VEHKKO_NDARRAY_NOALIAS_CONTRACT_CHECK != 0;
+inline constexpr bool runtime_layout_check           = VEHKKO_NDARRAY_LAYOUT_CHECK != 0;
+
+// Contract failures do not create or propagate library-defined exceptions.
+// Allocation functions may still propagate allocation failures.
+[[noreturn]] inline void contract_violation() noexcept
+{
+    std::terminate();
+}
+
+inline void require_contract(bool condition) noexcept
+{
+    if (!condition) {
+        contract_violation();
+    }
+}
+
+// Compile-time type checking
+// -----------------------------------------------------------------------------
+// Storage remains intentionally restricted to simple, byte-copyable objects.
+// Non-trivial but noexcept default construction is permitted; this supports
+// more POD-like numeric types without requiring a lifetime-policy abstraction.
+
+template<typename T>
+inline constexpr bool is_valid_storage_element_v =
+    !std::is_void_v<T> && !std::is_reference_v<T> && !std::is_const_v<T> &&
+    !std::is_volatile_v<T> && std::is_trivially_copyable_v<T> &&
+    std::is_trivially_destructible_v<T> && std::is_default_constructible_v<T> &&
+    std::is_standard_layout_v<T>;
+
+template<typename T>
+inline constexpr bool is_valid_view_element_v =
+    !std::is_reference_v<T> && !std::is_volatile_v<T> && !std::is_void_v<std::remove_cv_t<T>> &&
+    std::is_trivially_copyable_v<std::remove_cv_t<T>> &&
+    std::is_trivially_destructible_v<std::remove_cv_t<T>> &&
+    std::is_standard_layout_v<std::remove_cv_t<T>>;
+
+// Checked structural arithmetic
+// -----------------------------------------------------------------------------
+// These helpers are used only while storage or layout metadata is established.
+// Element access and algorithm traversal use plain arithmetic after validation.
+
+constexpr inline bool is_valid_alignment(index_t n) noexcept
+{
+    return n > 0 && (n & (n - 1)) == 0;
+}
+
+constexpr inline index_t max_index(index_t a, index_t b) noexcept
+{
+    return a > b ? a : b;
+}
+
+inline index_t checked_add(index_t a, index_t b) noexcept
+{
+    if constexpr (runtime_overflow_check) {
+        if (b > std::numeric_limits<index_t>::max() - a) {
+            contract_violation();
+        }
+    }
+    return a + b;
+}
+
+inline index_t checked_mul(index_t a, index_t b) noexcept
+{
+    if constexpr (runtime_overflow_check) {
+        if (a != 0 && b > std::numeric_limits<index_t>::max() / a) {
+            contract_violation();
+        }
+    }
+    return a * b;
+}
+
+template<index_t Rank> inline bool has_zero_extent(const index_t (&extent)[Rank]) noexcept
+{
+    for (index_t d = 0; d < Rank; ++d) {
+        if (extent[d] == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template<index_t Rank> inline index_t product(const index_t (&extent)[Rank]) noexcept
+{
+    if (has_zero_extent(extent)) {
+        return 0;
+    }
+
+    index_t n = 1;
+    for (index_t d = 0; d < Rank; ++d) {
+        n = checked_mul(n, extent[d]);
+    }
+    return n;
+}
+
+template<index_t Rank>
+inline void make_row_major_stride(const index_t (&extent)[Rank], index_t (&stride)[Rank]) noexcept
+{
+    if (has_zero_extent(extent)) {
+        for (index_t d = 0; d < Rank; ++d) {
+            stride[d] = 0;
+        }
+        return;
+    }
+
+    index_t s = 1;
+    for (index_t r = Rank; r > 0; --r) {
+        const index_t d = r - 1;
+        stride[d]       = s;
+        s               = checked_mul(s, extent[d]);
+    }
+}
+
+// Allocator
+// -----------------------------------------------------------------------------
+
+struct Allocator
+{
+    void* ctx = nullptr;
+
+    void* (*allocate)(void* ctx, index_t bytes, index_t alignment) = nullptr;
+
+    void (*deallocate)(void* ctx, void* ptr, index_t bytes, index_t alignment) noexcept = nullptr;
+};
+
+inline void* default_allocate(void*, index_t bytes, index_t alignment)
+{
+    return ::operator new[](bytes, std::align_val_t{alignment});
+}
+
+inline void default_deallocate(void*, void* ptr, index_t, index_t alignment) noexcept
+{
+    ::operator delete[](ptr, std::align_val_t{alignment});
+}
+
+inline Allocator default_allocator() noexcept
+{
+    return Allocator{nullptr, default_allocate, default_deallocate};
+}
+
+// Buffer: owning aligned dynamic memory
+// -----------------------------------------------------------------------------
+
+template<typename T> class Buffer
+{
+    static_assert(is_valid_storage_element_v<T>,
+                  "vehkko::ndarray::Buffer<T>: T must be non-cv, "
+                  "non-reference, trivially copyable, trivially destructible, "
+                  "nothrow default constructible, and standard-layout");
+
+public:
+    using element_type = T;
+    using value_type   = T;
+
+    Buffer() noexcept = default;
+
+    explicit Buffer(index_t size, index_t alignment = default_alignment,
+                    Allocator allocator = default_allocator()) noexcept
+        : size_(size)
+        , alignment_(max_index(alignment, alignof(T)))
+        , allocator_(allocator)
+    {
+        if constexpr (runtime_alignment_check) {
+            require_contract(is_valid_alignment(alignment));
+            require_contract(is_valid_alignment(alignment_));
+        }
+        if constexpr (runtime_allocator_check) {
+            require_contract(allocator_.allocate != nullptr);
+            require_contract(allocator_.deallocate != nullptr);
+        }
+        allocate_();
+    }
+
+    ~Buffer() noexcept { reset(); }
+
+    Buffer(const Buffer&)            = delete;
+    Buffer& operator=(const Buffer&) = delete;
+
+    Buffer(Buffer&& other) noexcept
+        : size_(other.size_)
+        , alignment_(other.alignment_)
+        , data_(other.data_)
+        , allocator_(other.allocator_)
+    {
+        other.clear_state_();
+    }
+
+    Buffer& operator=(Buffer&& other) noexcept
+    {
+        if (this != &other) {
+            reset();
+            size_      = other.size_;
+            alignment_ = other.alignment_;
+            data_      = other.data_;
+            allocator_ = other.allocator_;
+            other.clear_state_();
+        }
+        return *this;
+    }
+
+    void reset() noexcept
+    {
+        if (data_ == nullptr) {
+            clear_state_();
+            return;
+        }
+
+        std::destroy_n(data_, size_);
+        allocator_.deallocate(allocator_.ctx, static_cast<void*>(data_), bytes(), alignment_);
+        clear_state_();
+    }
+
+    T*       data() noexcept { return data_; }
+    const T* data() const noexcept { return data_; }
+
+    T*       begin() noexcept { return data_; }
+    const T* begin() const noexcept { return data_; }
+
+    T*       end() noexcept { return data_ == nullptr ? nullptr : data_ + size_; }
+    const T* end() const noexcept { return data_ == nullptr ? nullptr : data_ + size_; }
+
+    T& front() noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(size_ != 0);
+        }
+        return data_[0];
+    }
+
+    const T& front() const noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(size_ != 0);
+        }
+        return data_[0];
+    }
+
+    T& back() noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(size_ != 0);
+        }
+        return data_[size_ - 1];
+    }
+
+    const T& back() const noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(size_ != 0);
+        }
+        return data_[size_ - 1];
+    }
+
+    index_t  size() const noexcept { return size_; }
+    index_t  bytes() const noexcept { return size_ * sizeof(T); }
+    index_t  alignment() const noexcept { return alignment_; }
+    bool     empty() const noexcept { return size_ == 0; }
+    explicit operator bool() const noexcept { return data_ != nullptr; }
+
+    T& operator[](index_t i) noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(i < size_);
+        }
+        return data_[i];
+    }
+
+    const T& operator[](index_t i) const noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(i < size_);
+        }
+        return data_[i];
+    }
+
+private:
+    void allocate_() noexcept
+    {
+        if (size_ == 0) {
+            return;
+        }
+
+        const index_t byte_count = checked_mul(size_, sizeof(T));
+        void*         raw        = allocator_.allocate(allocator_.ctx, byte_count, alignment_);
+        if constexpr (runtime_allocator_check) {
+            require_contract(raw != nullptr);
+            require_contract(reinterpret_cast<std::uintptr_t>(raw) % alignment_ == 0);
+        }
+
+        data_ = static_cast<T*>(raw);
+        std::uninitialized_default_construct_n(data_, size_);
+    }
+
+    void clear_state_() noexcept
+    {
+        size_      = 0;
+        alignment_ = max_index(default_alignment, alignof(T));
+        data_      = nullptr;
+        allocator_ = default_allocator();
+    }
+
+private:
+    index_t   size_      = 0;
+    index_t   alignment_ = max_index(default_alignment, alignof(T));
+    T*        data_      = nullptr;
+    Allocator allocator_ = default_allocator();
+};
+
+// StaticBuffer: owning aligned fixed-capacity stack memory
+// -----------------------------------------------------------------------------
+
+template<typename T, index_t Capacity, index_t Alignment = default_alignment> class StaticBuffer
+{
+    static_assert(is_valid_storage_element_v<T>,
+                  "vehkko::ndarray::StaticBuffer<T, Capacity>: T must be "
+                  "non-cv, non-reference, trivially copyable, trivially "
+                  "destructible, nothrow default constructible, and "
+                  "standard-layout");
+    static_assert(Capacity > 0, "vehkko::ndarray::StaticBuffer: Capacity must be positive");
+    static_assert(is_valid_alignment(Alignment),
+                  "vehkko::ndarray::StaticBuffer: Alignment must be a positive "
+                  "power of two");
+
+public:
+    using element_type                      = T;
+    using value_type                        = T;
+    static constexpr index_t capacity_value = Capacity;
+
+    StaticBuffer() noexcept = default;
+
+    StaticBuffer(const StaticBuffer&)            = delete;
+    StaticBuffer& operator=(const StaticBuffer&) = delete;
+    StaticBuffer(StaticBuffer&&)                 = delete;
+    StaticBuffer& operator=(StaticBuffer&&)      = delete;
+    ~StaticBuffer() noexcept                     = default;
+
+    T*       data() noexcept { return data_; }
+    const T* data() const noexcept { return data_; }
+
+    T*       begin() noexcept { return data_; }
+    const T* begin() const noexcept { return data_; }
+    T*       end() noexcept { return data_ + Capacity; }
+    const T* end() const noexcept { return data_ + Capacity; }
+
+    T&       front() noexcept { return data_[0]; }
+    const T& front() const noexcept { return data_[0]; }
+    T&       back() noexcept { return data_[Capacity - 1]; }
+    const T& back() const noexcept { return data_[Capacity - 1]; }
+
+    static constexpr index_t size() noexcept { return Capacity; }
+    static constexpr index_t capacity() noexcept { return Capacity; }
+    static constexpr index_t bytes() noexcept { return Capacity * sizeof(T); }
+    static constexpr index_t alignment() noexcept { return max_index(Alignment, alignof(T)); }
+    static constexpr bool    empty() noexcept { return false; }
+    explicit                 operator bool() const noexcept { return true; }
+
+    T& operator[](index_t i) noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(i < Capacity);
+        }
+        return data_[i];
+    }
+
+    const T& operator[](index_t i) const noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(i < Capacity);
+        }
+        return data_[i];
+    }
+
+private:
+    alignas(max_index(Alignment, alignof(T))) T data_[Capacity];
+};
+
+// View: non-owning fixed-rank strided view
+// -----------------------------------------------------------------------------
+// View constness follows span semantics. A const View<T, Rank> still refers to
+// mutable T. Use View<const T, Rank> for read-only elements.
+
+template<typename T, index_t Rank> class View
+{
+    static_assert(is_valid_view_element_v<T>,
+                  "vehkko::ndarray::View<T, Rank>: T must be non-reference, "
+                  "non-volatile, trivially copyable, trivially destructible, "
+                  "and standard-layout; const T is allowed");
+    static_assert(Rank > 0, "vehkko::ndarray::View<T, Rank>: Rank must be positive");
+
+public:
+    using element_type            = T;
+    using value_type              = std::remove_const_t<T>;
+    static constexpr index_t rank = Rank;
+
+    View() noexcept = default;
+
+    View(T* data, const index_t (&extent)[Rank], const index_t (&stride)[Rank]) noexcept
+        : data_(data)
+    {
+        for (index_t d = 0; d < Rank; ++d) {
+            extent_[d] = extent[d];
+            stride_[d] = stride[d];
+        }
+        validate_layout_();
+    }
+
+    template<
+        typename U,
+        std::enable_if_t<std::is_const_v<T> && std::is_same_v<std::remove_const_t<T>, U>, int> = 0>
+    View(const View<U, Rank>& other) noexcept
+        : data_(other.data())
+    {
+        for (index_t d = 0; d < Rank; ++d) {
+            extent_[d] = other.extent(d);
+            stride_[d] = other.stride(d);
+        }
+    }
+
+    T* data() noexcept { return data_; }
+    T* data() const noexcept { return data_; }
+
+    index_t extent(index_t d) const noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(d < Rank);
+        }
+        return extent_[d];
+    }
+
+    index_t stride(index_t d) const noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(d < Rank);
+        }
+        return stride_[d];
+    }
+
+    const index_t* extents() const noexcept { return extent_; }
+    const index_t* strides() const noexcept { return stride_; }
+
+    index_t size() const noexcept
+    {
+        index_t n = 1;
+        for (index_t d = 0; d < Rank; ++d) {
+            n *= extent_[d];
+        }
+        return n;
+    }
+
+    bool empty() const noexcept
+    {
+        for (index_t d = 0; d < Rank; ++d) {
+            if (extent_[d] == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    explicit operator bool() const noexcept { return data_ != nullptr; }
+
+    template<typename... I> T& operator()(I... indices) noexcept { return access_(indices...); }
+
+    template<typename... I> T& operator()(I... indices) const noexcept
+    {
+        return access_(indices...);
+    }
+
+private:
+    template<typename... I> T& access_(I... indices) const noexcept
+    {
+        static_assert(sizeof...(I) == Rank,
+                      "vehkko::ndarray::View::operator(): wrong number of "
+                      "indices");
+
+        const index_t idx[Rank] = {static_cast<index_t>(indices)...};
+
+        if constexpr (runtime_bounds_check) {
+            for (index_t d = 0; d < Rank; ++d) {
+                require_contract(idx[d] < extent_[d]);
+            }
+        }
+
+        index_t linear = 0;
+        for (index_t d = 0; d < Rank; ++d) {
+            linear += idx[d] * stride_[d];
+        }
+        return data_[linear];
+    }
+
+    void validate_layout_() const noexcept
+    {
+        if constexpr (runtime_layout_check || runtime_overflow_check) {
+            bool nonempty = true;
+            for (index_t d = 0; d < Rank; ++d) {
+                if (extent_[d] == 0) {
+                    nonempty = false;
+                    break;
+                }
+            }
+
+            if (!nonempty) {
+                return;
+            }
+
+            if constexpr (runtime_layout_check) {
+                require_contract(data_ != nullptr);
+                for (index_t d = 0; d < Rank; ++d) {
+                    if (extent_[d] > 1) {
+                        require_contract(stride_[d] != 0);
+                    }
+                }
+            }
+
+            if constexpr (runtime_overflow_check) {
+                (void)product(extent_);
+
+                index_t max_offset = 0;
+                for (index_t d = 0; d < Rank; ++d) {
+                    max_offset = checked_add(max_offset, checked_mul(extent_[d] - 1, stride_[d]));
+                }
+
+                const index_t span_elements = checked_add(max_offset, index_t{1});
+                const index_t span_bytes    = checked_mul(span_elements, sizeof(value_type));
+
+                if (data_ != nullptr) {
+                    const std::uintptr_t begin = reinterpret_cast<std::uintptr_t>(data_);
+                    require_contract(span_bytes <=
+                                     std::numeric_limits<std::uintptr_t>::max() - begin);
+                }
+            }
+        }
+    }
+
+private:
+    T*      data_ = nullptr;
+    index_t extent_[Rank]{};
+    index_t stride_[Rank]{};
+};
+
+// Array: owning row-major dynamic ndarray
+// -----------------------------------------------------------------------------
+
+template<typename T, index_t Rank> class Array
+{
+    static_assert(is_valid_storage_element_v<T>,
+                  "vehkko::ndarray::Array<T, Rank>: T must be non-cv, "
+                  "non-reference, trivially copyable, trivially destructible, "
+                  "nothrow default constructible, and standard-layout");
+    static_assert(Rank > 0, "vehkko::ndarray::Array<T, Rank>: Rank must be positive");
+
+public:
+    using element_type            = T;
+    using value_type              = T;
+    static constexpr index_t rank = Rank;
+
+    Array() noexcept = default;
+
+    explicit Array(const index_t (&extent)[Rank], index_t alignment = default_alignment,
+                   Allocator allocator = default_allocator()) noexcept
+        : buffer_(product(extent), alignment, allocator)
+    {
+        set_shape_(extent);
+    }
+
+    Array(const Array&)            = delete;
+    Array& operator=(const Array&) = delete;
+
+    Array(Array&& other) noexcept
+        : buffer_(std::move(other.buffer_))
+    {
+        copy_shape_from_(other);
+        other.clear_shape_();
+    }
+
+    Array& operator=(Array&& other) noexcept
+    {
+        if (this != &other) {
+            buffer_ = std::move(other.buffer_);
+            copy_shape_from_(other);
+            other.clear_shape_();
+        }
+        return *this;
+    }
+
+    void reshape(const index_t (&extent)[Rank]) noexcept
+    {
+        const index_t new_size = product(extent);
+        if constexpr (runtime_shape_check) {
+            require_contract(new_size == size());
+        }
+        set_shape_(extent);
+    }
+
+    T*       data() noexcept { return buffer_.data(); }
+    const T* data() const noexcept { return buffer_.data(); }
+
+    T*       begin() noexcept { return buffer_.begin(); }
+    const T* begin() const noexcept { return buffer_.begin(); }
+    T*       end() noexcept { return buffer_.end(); }
+    const T* end() const noexcept { return buffer_.end(); }
+
+    T&       front() noexcept { return buffer_.front(); }
+    const T& front() const noexcept { return buffer_.front(); }
+    T&       back() noexcept { return buffer_.back(); }
+    const T& back() const noexcept { return buffer_.back(); }
+
+    index_t  size() const noexcept { return buffer_.size(); }
+    index_t  bytes() const noexcept { return buffer_.bytes(); }
+    index_t  alignment() const noexcept { return buffer_.alignment(); }
+    bool     empty() const noexcept { return buffer_.empty(); }
+    explicit operator bool() const noexcept { return static_cast<bool>(buffer_); }
+
+    index_t extent(index_t d) const noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(d < Rank);
+        }
+        return extent_[d];
+    }
+
+    index_t stride(index_t d) const noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(d < Rank);
+        }
+        return stride_[d];
+    }
+
+    const index_t* extents() const noexcept { return extent_; }
+    const index_t* strides() const noexcept { return stride_; }
+
+    View<T, Rank> view() & noexcept { return View<T, Rank>(buffer_.data(), extent_, stride_); }
+
+    View<const T, Rank> view() const& noexcept
+    {
+        return View<const T, Rank>(buffer_.data(), extent_, stride_);
+    }
+
+    View<T, Rank> view() && noexcept = delete;
+
+    View<T, Rank> view() const&& noexcept = delete;
+
+    template<typename... I> T& operator()(I... indices) noexcept
+    {
+        static_assert(sizeof...(I) == Rank,
+                      "vehkko::ndarray::Array::operator(): wrong number of indices");
+
+        const index_t idx[Rank] = {static_cast<index_t>(indices)...};
+        if constexpr (runtime_bounds_check) {
+            for (index_t d = 0; d < Rank; ++d) {
+                require_contract(idx[d] < extent_[d]);
+            }
+        }
+
+        index_t linear = 0;
+        for (index_t d = 0; d < Rank; ++d) {
+            linear += idx[d] * stride_[d];
+        }
+        return buffer_.data()[linear];
+    }
+
+    template<typename... I> const T& operator()(I... indices) const noexcept
+    {
+        static_assert(sizeof...(I) == Rank,
+                      "vehkko::ndarray::Array::operator(): wrong number of indices");
+
+        const index_t idx[Rank] = {static_cast<index_t>(indices)...};
+        if constexpr (runtime_bounds_check) {
+            for (index_t d = 0; d < Rank; ++d) {
+                require_contract(idx[d] < extent_[d]);
+            }
+        }
+
+        index_t linear = 0;
+        for (index_t d = 0; d < Rank; ++d) {
+            linear += idx[d] * stride_[d];
+        }
+        return buffer_.data()[linear];
+    }
+
+    T&       operator[](index_t i) noexcept { return buffer_[i]; }
+    const T& operator[](index_t i) const noexcept { return buffer_[i]; }
+
+private:
+    void set_shape_(const index_t (&extent)[Rank]) noexcept
+    {
+        for (index_t d = 0; d < Rank; ++d) {
+            extent_[d] = extent[d];
+        }
+        make_row_major_stride(extent_, stride_);
+    }
+
+    void copy_shape_from_(const Array& other) noexcept
+    {
+        for (index_t d = 0; d < Rank; ++d) {
+            extent_[d] = other.extent_[d];
+            stride_[d] = other.stride_[d];
+        }
+    }
+
+    void clear_shape_() noexcept
+    {
+        for (index_t d = 0; d < Rank; ++d) {
+            extent_[d] = 0;
+            stride_[d] = 0;
+        }
+    }
+
+private:
+    Buffer<T> buffer_;
+    index_t   extent_[Rank]{};
+    index_t   stride_[Rank]{};
+};
+
+// StaticArray: owning row-major fixed-capacity ndarray
+// -----------------------------------------------------------------------------
+
+template<typename T, index_t Rank, index_t Capacity, index_t Alignment = default_alignment>
+class StaticArray
+{
+    static_assert(is_valid_storage_element_v<T>,
+                  "vehkko::ndarray::StaticArray: invalid storage element type");
+    static_assert(Rank > 0, "vehkko::ndarray::StaticArray: Rank must be positive");
+    static_assert(Capacity > 0, "vehkko::ndarray::StaticArray: Capacity must be positive");
+
+public:
+    using element_type                      = T;
+    using value_type                        = T;
+    static constexpr index_t rank           = Rank;
+    static constexpr index_t capacity_value = Capacity;
+
+    StaticArray() noexcept = default;
+
+    explicit StaticArray(const index_t (&extent)[Rank]) noexcept { reshape(extent); }
+
+    StaticArray(const StaticArray&)            = delete;
+    StaticArray& operator=(const StaticArray&) = delete;
+    StaticArray(StaticArray&&)                 = delete;
+    StaticArray& operator=(StaticArray&&)      = delete;
+    ~StaticArray() noexcept                    = default;
+
+    void reshape(const index_t (&extent)[Rank]) noexcept
+    {
+        const index_t n = product(extent);
+        if constexpr (runtime_shape_check) {
+            require_contract(n <= Capacity);
+        }
+
+        size_ = n;
+        for (index_t d = 0; d < Rank; ++d) {
+            extent_[d] = extent[d];
+        }
+        make_row_major_stride(extent_, stride_);
+    }
+
+    T*       data() noexcept { return storage_.data(); }
+    const T* data() const noexcept { return storage_.data(); }
+
+    T*       begin() noexcept { return storage_.data(); }
+    const T* begin() const noexcept { return storage_.data(); }
+    T*       end() noexcept { return storage_.data() + size_; }
+    const T* end() const noexcept { return storage_.data() + size_; }
+
+    T& front() noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(size_ != 0);
+        }
+        return storage_[0];
+    }
+
+    const T& front() const noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(size_ != 0);
+        }
+        return storage_[0];
+    }
+
+    T& back() noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(size_ != 0);
+        }
+        return storage_[size_ - 1];
+    }
+
+    const T& back() const noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(size_ != 0);
+        }
+        return storage_[size_ - 1];
+    }
+
+    index_t                  size() const noexcept { return size_; }
+    static constexpr index_t capacity() noexcept { return Capacity; }
+    index_t                  bytes() const noexcept { return size_ * sizeof(T); }
+    static constexpr index_t capacity_bytes() noexcept { return Capacity * sizeof(T); }
+    static constexpr index_t alignment() noexcept
+    {
+        return StaticBuffer<T, Capacity, Alignment>::alignment();
+    }
+    bool     empty() const noexcept { return size_ == 0; }
+    explicit operator bool() const noexcept { return size_ != 0; }
+
+    index_t extent(index_t d) const noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(d < Rank);
+        }
+        return extent_[d];
+    }
+
+    index_t stride(index_t d) const noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(d < Rank);
+        }
+        return stride_[d];
+    }
+
+    const index_t* extents() const noexcept { return extent_; }
+    const index_t* strides() const noexcept { return stride_; }
+
+    View<T, Rank> view() & noexcept { return View<T, Rank>(storage_.data(), extent_, stride_); }
+
+    View<const T, Rank> view() const& noexcept
+    {
+        return View<const T, Rank>(storage_.data(), extent_, stride_);
+    }
+
+    View<T, Rank> view() && noexcept = delete;
+
+    View<const T, Rank> view() const&& noexcept = delete;
+
+    template<typename... I> T& operator()(I... indices) noexcept
+    {
+        static_assert(sizeof...(I) == Rank,
+                      "vehkko::ndarray::StaticArray::operator(): wrong number of indices");
+
+        const index_t idx[Rank] = {static_cast<index_t>(indices)...};
+        if constexpr (runtime_bounds_check) {
+            for (index_t d = 0; d < Rank; ++d) {
+                require_contract(idx[d] < extent_[d]);
+            }
+        }
+
+        index_t linear = 0;
+        for (index_t d = 0; d < Rank; ++d) {
+            linear += idx[d] * stride_[d];
+        }
+        return storage_.data()[linear];
+    }
+
+    template<typename... I> const T& operator()(I... indices) const noexcept
+    {
+        static_assert(sizeof...(I) == Rank,
+                      "vehkko::ndarray::StaticArray::operator(): wrong number of indices");
+
+        const index_t idx[Rank] = {static_cast<index_t>(indices)...};
+        if constexpr (runtime_bounds_check) {
+            for (index_t d = 0; d < Rank; ++d) {
+                require_contract(idx[d] < extent_[d]);
+            }
+        }
+
+        index_t linear = 0;
+        for (index_t d = 0; d < Rank; ++d) {
+            linear += idx[d] * stride_[d];
+        }
+        return storage_.data()[linear];
+    }
+
+    T& operator[](index_t i) noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(i < size_);
+        }
+        return storage_[i];
+    }
+
+    const T& operator[](index_t i) const noexcept
+    {
+        if constexpr (runtime_bounds_check) {
+            require_contract(i < size_);
+        }
+        return storage_[i];
+    }
+
+private:
+    StaticBuffer<T, Capacity, Alignment> storage_;
+    index_t                              size_ = 0;
+    index_t                              extent_[Rank]{};
+    index_t                              stride_[Rank]{};
+};
+
+// Construction helpers
+// -----------------------------------------------------------------------------
+
+template<typename T>
+inline Array<T, 1> make_array1d(index_t n0, index_t alignment = default_alignment,
+                                Allocator allocator = default_allocator())
+{
+    const index_t extent[1] = {n0};
+    return Array<T, 1>(extent, alignment, allocator);
+}
+
+template<typename T>
+inline Array<T, 2> make_array2d(index_t n0, index_t n1, index_t alignment = default_alignment,
+                                Allocator allocator = default_allocator())
+{
+    const index_t extent[2] = {n0, n1};
+    return Array<T, 2>(extent, alignment, allocator);
+}
+
+template<typename T>
+inline Array<T, 3> make_array3d(index_t n0, index_t n1, index_t n2,
+                                index_t   alignment = default_alignment,
+                                Allocator allocator = default_allocator())
+{
+    const index_t extent[3] = {n0, n1, n2};
+    return Array<T, 3>(extent, alignment, allocator);
+}
+
+template<typename T, index_t Rank>
+inline View<T, Rank> make_view(T* data, const index_t (&extent)[Rank]) noexcept
+{
+    index_t stride[Rank];
+    make_row_major_stride(extent, stride);
+    return View<T, Rank>(data, extent, stride);
+}
+
+template<typename T> inline View<T, 1> make_view1d(T* data, index_t n0) noexcept
+{
+    const index_t extent[1] = {n0};
+    const index_t stride[1] = {1};
+    return View<T, 1>(data, extent, stride);
+}
+
+template<typename T> inline View<T, 2> make_view2d(T* data, index_t n0, index_t n1) noexcept
+{
+    const index_t extent[2] = {n0, n1};
+    const index_t stride[2] = {n1, 1};
+    return View<T, 2>(data, extent, stride);
+}
+
+template<typename T>
+inline View<T, 3> make_view3d(T* data, index_t n0, index_t n1, index_t n2) noexcept
+{
+    const index_t extent[3] = {n0, n1, n2};
+    index_t       stride[3];
+    make_row_major_stride(extent, stride);
+    return View<T, 3>(data, extent, stride);
+}
+
+template<typename T, index_t Rank>
+inline View<T, Rank> make_strided_view(T* data, const index_t (&extent)[Rank],
+                                       const index_t (&stride)[Rank]) noexcept
+{
+    return View<T, Rank>(data, extent, stride);
+}
+
+template<typename T> inline View<T, 1> make_strided_view1d(T* data, index_t n0, index_t s0) noexcept
+{
+    const index_t extent[1] = {n0};
+    const index_t stride[1] = {s0};
+    return View<T, 1>(data, extent, stride);
+}
+
+template<typename T>
+inline View<T, 2> make_strided_view2d(T* data, index_t n0, index_t n1, index_t s0,
+                                      index_t s1) noexcept
+{
+    const index_t extent[2] = {n0, n1};
+    const index_t stride[2] = {s0, s1};
+    return View<T, 2>(data, extent, stride);
+}
+
+template<typename T>
+inline View<T, 3> make_strided_view3d(T* data, index_t n0, index_t n1, index_t n2, index_t s0,
+                                      index_t s1, index_t s2) noexcept
+{
+    const index_t extent[3] = {n0, n1, n2};
+    const index_t stride[3] = {s0, s1, s2};
+    return View<T, 3>(data, extent, stride);
+}
+
+template<typename T, index_t Rank>
+inline View<const T, Rank> as_const_view(View<T, Rank> v) noexcept
+{
+    return View<const T, Rank>(v);
+}
+
+// Layout and shape queries
+// -----------------------------------------------------------------------------
+
+template<typename T, index_t Rank> inline bool is_inner_contiguous(View<T, Rank> v) noexcept
+{
+    return v.stride(Rank - 1) == 1;
+}
+
+template<typename T, index_t Rank> inline bool is_row_major_contiguous(View<T, Rank> v) noexcept
+{
+    if (v.empty()) {
+        return true;
+    }
+
+    index_t expected = 1;
+    for (index_t r = Rank; r > 0; --r) {
+        const index_t d = r - 1;
+        if (v.stride(d) != expected) {
+            return false;
+        }
+        expected *= v.extent(d);
+    }
+    return true;
+}
+
+template<typename T, typename U, index_t Rank>
+inline bool same_extents(View<T, Rank> a, View<U, Rank> b) noexcept
+{
+    for (index_t d = 0; d < Rank; ++d) {
+        if (a.extent(d) != b.extent(d)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template<typename T, typename U, index_t Rank>
+inline bool same_layout(View<T, Rank> a, View<U, Rank> b) noexcept
+{
+    for (index_t d = 0; d < Rank; ++d) {
+        if (a.extent(d) != b.extent(d) || a.stride(d) != b.stride(d)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+template<typename T, typename U, index_t Rank>
+inline bool is_same_data(View<T, Rank> a, View<U, Rank> b) noexcept
+{
+    return static_cast<const void*>(a.data()) == static_cast<const void*>(b.data());
+}
+
+// View derivation
+// -----------------------------------------------------------------------------
+
+template<typename T> inline View<T, 1> row_view(View<T, 2> v, index_t i) noexcept
+{
+    if constexpr (runtime_bounds_check) {
+        require_contract(i < v.extent(0));
+    }
+
+    const index_t extent[1] = {v.extent(1)};
+    const index_t stride[1] = {v.stride(1)};
+    const index_t offset    = i * v.stride(0);
+    T*            data      = v.data();
+    if (data != nullptr && extent[0] != 0) {
+        data += offset;
+    }
+    return View<T, 1>(data, extent, stride);
+}
+
+template<typename T> inline View<T, 1> col_view(View<T, 2> v, index_t j) noexcept
+{
+    if constexpr (runtime_bounds_check) {
+        require_contract(j < v.extent(1));
+    }
+
+    const index_t extent[1] = {v.extent(0)};
+    const index_t stride[1] = {v.stride(0)};
+    const index_t offset    = j * v.stride(1);
+    T*            data      = v.data();
+    if (data != nullptr && extent[0] != 0) {
+        data += offset;
+    }
+    return View<T, 1>(data, extent, stride);
+}
+
+template<typename T>
+inline View<T, 2> block_view(View<T, 2> v, index_t i0, index_t j0, index_t n0, index_t n1) noexcept
+{
+    if constexpr (runtime_bounds_check) {
+        require_contract(i0 <= v.extent(0));
+        require_contract(j0 <= v.extent(1));
+        require_contract(n0 <= v.extent(0) - i0);
+        require_contract(n1 <= v.extent(1) - j0);
+    }
+
+    const index_t extent[2] = {n0, n1};
+    const index_t stride[2] = {v.stride(0), v.stride(1)};
+    const index_t offset    = i0 * v.stride(0) + j0 * v.stride(1);
+    T*            data      = v.data();
+    if (data != nullptr && n0 != 0 && n1 != 0) {
+        data += offset;
+    }
+    return View<T, 2>(data, extent, stride);
+}
+
+template<typename T, index_t Rank> inline View<T, 1> flatten_view(View<T, Rank> v) noexcept
+{
+    if constexpr (runtime_layout_check) {
+        require_contract(is_row_major_contiguous(v));
+    }
+
+    const index_t extent[1] = {v.size()};
+    const index_t stride[1] = {1};
+    return View<T, 1>(v.data(), extent, stride);
+}
+
+}   // namespace vehkko::ndarray
