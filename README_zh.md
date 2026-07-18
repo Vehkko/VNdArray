@@ -24,18 +24,19 @@ ndarray_ops.hpp  alias-aware basic algorithms
 
 - C++17，Header-Only，无第三方依赖；
 - 默认 64 字节对齐；
-- `Buffer<T>`：动态、对齐、不可拷贝、可移动的一维存储；
+- `Buffer<T>`：动态、对齐、可拷贝、可移动的一维存储；
 - `StaticBuffer<T, Capacity>`：栈上固定容量存储；
 - `View<T, Rank>`：固定 Rank、非拥有、可跨步多维视图；
 - `Array<T, Rank>`：动态 owning row-major 数组；
 - `StaticArray<T, Rank, Capacity>`：固定容量、可改变逻辑形状的 row-major 数组；
+- owning 容器采用值语义并深拷贝数据；复制 View 只复制其句柄元数据；
 - 自定义函数指针 Allocator，为 arena、pinned memory 等扩展保留入口；
 - 普通算法默认处理危险的部分重叠；
 - `_noalias` 算法无分配，并为连续数据提供 `restrict` 快路径；
 - Rank 1–3 采用直接循环，较高 Rank 使用通用固定 Rank 遍历器；
 - shape、stride、字节数和地址范围的结构性溢出检查；
-- 契约失败不抛出库自定义异常，统一调用 `std::terminate()`；
-- 只有分配器自身可能传播分配异常，例如 `std::bad_alloc`。
+- 契约失败统一调用 `std::terminate()`；
+- owning 操作中的分配失败或元素构造失败可以传播给调用者。
 
 ---
 
@@ -48,7 +49,7 @@ ndarray_ops.hpp  alias-aware basic algorithms
   - trivially copyable；
   - trivially destructible；
   - standard-layout；
-  - nothrow default-constructible。
+  - default-constructible。
 
 `View<const T, Rank>` 可以用于只读元素。
 
@@ -213,11 +214,13 @@ double* ptr = buffer.data();
 
 主要性质：
 
-- 不可拷贝；
+- 值语义，拷贝构造和拷贝赋值均深拷贝；
 - 可移动；
 - 默认构造为空；
 - 默认初始化遵循元素的 default initialization，不主动填零；
 - 提供 `data()`、`begin()`、`end()`、`front()`、`back()`、`size()`、`bytes()` 和 `alignment()`。
+
+动态容器的副本保留源对象的 size、alignment 和 Allocator 句柄；拷贝赋值会相应替换目标对象的存储。
 
 注意：
 
@@ -653,6 +656,7 @@ auto emax = max_abs_diff(x, y);
 auto e2 = squared_diff_norm(x, y);
 
 // all_close(x, y, atol, rtol)
+// 仅适用于浮点元素类型。
 //
 // atol:
 //   绝对误差容限，无默认值，调用者必须显式提供。
@@ -701,7 +705,7 @@ copy_to(dst, src);
 6. 连续重叠复制使用 `std::memmove`；
 7. Rank-1 相同步长复制尽可能选择正向或反向遍历，避免临时量。
 
-因此普通接口默认安全，但在复杂重叠路径中可能分配，并可能传播分配失败。
+因此普通接口默认安全，但在复杂重叠路径中可能分配临时存储。分配失败或元素构造失败可以传播给调用者。
 
 ## `_noalias` 接口
 
@@ -784,7 +788,7 @@ struct Allocator {
   //   请求的字节对齐。
   //
   // 返回：
-  //   满足 alignment 的内存地址。
+  //   非空且满足 alignment 的内存地址。
   void* (*allocate)(void* ctx,
                     index_t bytes,
                     index_t alignment);
@@ -934,4 +938,4 @@ int main() {
 std::terminate();
 ```
 
-分配器自身仍可传播分配失败。普通 alias-safe 算法在复杂部分重叠时可能创建临时 `Array`，因此此类调用可能因分配失败抛出 `std::bad_alloc`。
+owning 容器构造、拷贝、赋值或创建临时 `Array` 时发生的分配失败和元素构造失败，库不会进行转换，可以直接传播给调用者。释放回调仍必须为 `noexcept`。

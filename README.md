@@ -24,18 +24,19 @@ Include only `ndarray.hpp` when only containers and Views are needed; include `n
 
 - C++17, header-only, with no third-party dependencies;
 - 64-byte alignment by default;
-- `Buffer<T>`: dynamic, aligned, non-copyable, movable one-dimensional storage;
+- `Buffer<T>`: dynamic, aligned, copyable and movable one-dimensional storage;
 - `StaticBuffer<T, Capacity>`: fixed-capacity stack storage;
 - `View<T, Rank>`: fixed-Rank, non-owning, strided multidimensional View;
 - `Array<T, Rank>`: dynamic owning row-major array;
 - `StaticArray<T, Rank, Capacity>`: fixed-capacity row-major array with a mutable logical shape;
+- owning containers have value semantics and perform deep copies; copying a View copies only its handle metadata;
 - custom function-pointer Allocator, leaving an extension point for arenas, pinned memory, and similar use cases;
 - regular algorithms safely handle dangerous partial overlap by default;
 - `_noalias` algorithms perform no allocations and provide a `restrict` fast path for contiguous data;
 - direct loops are used for Rank 1–3, while higher Ranks use a generic fixed-Rank iterator;
 - structural overflow checks for shapes, strides, byte counts, and address ranges;
-- contract failures do not throw library-defined exceptions and consistently call `std::terminate()`;
-- only the allocator itself may propagate allocation exceptions such as `std::bad_alloc`.
+- contract failures consistently call `std::terminate()`;
+- allocation or element-construction failures from owning operations may propagate to the caller.
 
 ---
 
@@ -48,7 +49,7 @@ Include only `ndarray.hpp` when only containers and Views are needed; include `n
   - trivially copyable;
   - trivially destructible;
   - standard-layout;
-  - nothrow default-constructible.
+  - default-constructible.
 
 `View<const T, Rank>` can be used for read-only elements.
 
@@ -220,11 +221,13 @@ double* ptr = buffer.data();
 
 Main properties:
 
-- non-copyable;
+- value semantics with deep-copying copy construction and copy assignment;
 - movable;
 - default construction creates an empty Buffer;
 - default initialization follows the element type's default initialization and does not explicitly zero-fill the storage;
 - provides `data()`, `begin()`, `end()`, `front()`, `back()`, `size()`, `bytes()`, and `alignment()`.
+
+Dynamic copies preserve the source size, alignment, and Allocator handle; copy assignment replaces the destination storage accordingly.
 
 Note:
 
@@ -662,6 +665,7 @@ auto emax = max_abs_diff(x, y);
 auto e2 = squared_diff_norm(x, y);
 
 // all_close(x, y, atol, rtol)
+// Defined only for floating-point element types.
 //
 // atol:
 //   Absolute-error tolerance. There is no default; the caller must provide it
@@ -712,7 +716,7 @@ When alias dispatch is enabled by default, regular APIs:
 6. use `std::memmove` for contiguous overlapping copies;
 7. choose forward or backward traversal whenever possible for Rank-1 copies with equal strides, avoiding temporaries.
 
-Regular APIs are therefore safe by default, but complex-overlap paths may allocate and may propagate allocation failure.
+Regular APIs are therefore safe by default, but complex-overlap paths may allocate temporary storage. Allocation or element-construction failures may propagate to the caller.
 
 ## `_noalias` APIs
 
@@ -796,7 +800,7 @@ struct Allocator {
   //   Requested alignment in bytes.
   //
   // Returns:
-  //   A memory address satisfying alignment.
+  //   A non-null memory address satisfying alignment.
   void* (*allocate)(void* ctx,
                     index_t bytes,
                     index_t alignment);
@@ -947,4 +951,4 @@ the library calls:
 std::terminate();
 ```
 
-The allocator itself may still propagate allocation failure. Regular alias-safe algorithms may create a temporary `Array` for complex partial overlap, so such calls may throw `std::bad_alloc` if allocation fails.
+Allocation and element-construction failures from owning construction, copying, assignment, or temporary `Array` creation are not converted by the library and may propagate to the caller. Deallocation callbacks remain `noexcept`.
